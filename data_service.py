@@ -5,10 +5,13 @@ Cache strategy:
   • fetch_latest()   → cached 30 s  (live KPI cards)
   • fetch_history()  → cached 60 s  (charts / sparklines)
   • fetch_all()      → cached 5 min (reports — heavy call, rarely changes)
+  • get_thresholds() → cached 5 s   (alert/warning thresholds, see below)
 
 No extra libraries — uses a plain dict + datetime comparison.
 """
 
+import os
+import json
 import requests
 import pandas as pd
 import threading
@@ -27,6 +30,10 @@ HEADERS = {
 }
 
 # ── Parameter metadata ───────────────────────────────────────────
+# "lo"/"hi" here are only the DEFAULT thresholds (used the very first time
+# the app runs, before anyone has saved anything on the Settings page).
+# Once a user saves thresholds, the live values come from get_thresholds()
+# below — never read PARAMS[...]["lo"/"hi"] directly elsewhere in the app.
 PARAMS = {
     "moisture":     {"label": "Soil Moisture",  "unit": "%",     "min": 0,   "max": 100,  "lo": 20,  "hi": 80,   "icon": "💧"},
     "temperature":  {"label": "Temperature",    "unit": "°C",    "min": 0,   "max": 60,   "lo": 10,  "hi": 40,   "icon": "🌡"},
@@ -71,12 +78,85 @@ def _set(key, value, ttl_seconds):
             "expires": datetime.now() + timedelta(seconds=ttl_seconds),
         }
 
+def _invalidate_key(key):
+    with _lock:
+        _cache.pop(key, None)
+
 def cache_info():
     """Return human-readable cache status (useful for debugging)."""
     now = datetime.now()
     with _lock:
         return {k: f"expires in {int((v['expires']-now).total_seconds())}s"
                 for k, v in _cache.items() if now < v["expires"]}
+
+# ════════════════════════════════════════════════════════════════
+#  Alert / warning thresholds — single source of truth
+# ════════════════════════════════════════════════════════════════
+# Render's free-tier filesystem resets on every spin-down/redeploy, so we
+# DON'T store thresholds in a local file. Instead they're saved through two
+# small PHP endpoints on your existing cPanel hosting (same host as
+# get_soil.php) — that storage is permanent and free.
+#
+#   GET  THRESHOLDS_GET_URL   → returns the saved JSON ({} if none yet)
+#   POST THRESHOLDS_SAVE_URL  → body: {"<param>": {"lo":.., "hi":..}, ..., "key": SECRET}
+#
+# get_thresholds() is still cached 5 s (re-using the TTL cache above) so a
+# page that calls it many times per render doesn't hammer the cPanel host.
+THRESHOLDS_GET_URL  = "https://ecoloop.in/soil_api/get_thresholds.php"
+THRESHOLDS_SAVE_URL = "https://ecoloop.in/soil_api/save_thresholds.php"
+
+# Must exactly match $SECRET in save_thresholds.php on cPanel.
+# Better: set this as a Render environment variable instead of hardcoding it.
+THRESHOLDS_SECRET = os.environ.get("THRESHOLDS_SECRET", "change-this-to-something-only-you-know")
+
+def _read_thresholds_remote():
+    try:
+        r = requests.get(THRESHOLDS_GET_URL, headers=HEADERS, timeout=8)
+        r.raise_for_status()
+        return r.json() or {}
+    except Exception as e:
+        print(f"[thresholds] remote read failed: {e}")
+        return {}
+
+def get_thresholds():
+    """Current {param: {"lo":.., "hi":..}} — defaults merged with any saved overrides."""
+    cached = _get("thresholds")
+    if cached is not None:
+        return cached
+    saved = _read_thresholds_remote()
+    result = {}
+    for key, meta in PARAMS.items():
+        override = saved.get(key, {})
+        result[key] = {
+            "lo": override.get("lo", meta["lo"]),
+            "hi": override.get("hi", meta["hi"]),
+        }
+    _set("thresholds", result, 5)
+    return result
+
+def set_thresholds(new_values: dict):
+    """
+    Persist new lo/hi thresholds via the cPanel endpoint.
+    new_values = {param: {"lo": x, "hi": y}, ...}
+    Called by the Settings page "Save Thresholds" button.
+    """
+    current = get_thresholds()
+    for key, vals in new_values.items():
+        if key not in PARAMS:
+            continue
+        lo = vals.get("lo", current[key]["lo"])
+        hi = vals.get("hi", current[key]["hi"])
+        current[key] = {"lo": float(lo), "hi": float(hi)}
+    try:
+        payload = dict(current)
+        payload["key"] = THRESHOLDS_SECRET
+        r = requests.post(THRESHOLDS_SAVE_URL, json=payload, headers=HEADERS, timeout=8)
+        r.raise_for_status()
+        print(f"[thresholds] saved to cPanel: {list(new_values.keys())}")
+    except Exception as e:
+        print(f"[thresholds] remote save failed: {e}")
+    _invalidate_key("thresholds")  # next get_thresholds() re-fetches immediately
+    return current
 
 # ════════════════════════════════════════════════════════════════
 #  API helpers
@@ -156,10 +236,12 @@ def to_df(rows):
 # ── Status helpers ───────────────────────────────────────────────
 
 def get_status(key, value):
+    """Normal / Warning / Critical — always evaluated against the CURRENT
+    saved thresholds, so this updates the moment Settings are saved."""
     if value is None:
         return "unknown", C["muted"]
-    m   = PARAMS.get(key, {})
-    lo, hi = m.get("lo", 0), m.get("hi", 9999)
+    th = get_thresholds().get(key, {})
+    lo, hi = th.get("lo", 0), th.get("hi", 9999)
     if lo <= value <= hi:
         return "Normal", C["green"]
     gap = (hi - lo) * 0.2
@@ -170,46 +252,63 @@ def get_status(key, value):
 def soil_health_score(row):
     if not row:
         return 0
+    thresholds = get_thresholds()
     scores = []
     for key in PARAMS:
         val = row.get(key)
         if val is None:
             continue
-        m    = PARAMS[key]
-        mid  = (m["lo"] + m["hi"]) / 2
-        span = (m["hi"] - m["lo"]) / 2
+        th = thresholds.get(key, {})
+        lo, hi = th.get("lo"), th.get("hi")
+        if lo is None or hi is None or hi == lo:
+            continue
+        mid  = (lo + hi) / 2
+        span = (hi - lo) / 2
         score = max(0, 100 - abs(float(val) - mid) / span * 50)
         scores.append(min(100, score))
     return round(sum(scores) / len(scores), 1) if scores else 0
 
 # ── Alert engine ─────────────────────────────────────────────────
-
+# Each rule says: for this param, "low" means below the current lo threshold
+# (or "high" means above the current hi threshold). No hardcoded numbers —
+# everything reads from get_thresholds(), so saved Settings changes flow
+# straight through to alerts. (Previously these numbers were hardcoded and
+# disconnected from PARAMS — e.g. temperature low fired at <5 even though
+# PARAMS said lo=10. That inconsistency is now gone by construction.)
 ALERT_RULES = [
-    ("moisture",     lambda v: v < 20,   "CRITICAL", "Moisture critically low — risk of crop stress"),
-    ("moisture",     lambda v: v > 80,   "WARNING",  "Moisture too high — waterlogging risk"),
-    ("ph",           lambda v: v < 5.5,  "WARNING",  "pH too acidic — nutrient lock-out likely"),
-    ("ph",           lambda v: v > 7.5,  "WARNING",  "pH too alkaline — limits phosphorus uptake"),
-    ("temperature",  lambda v: v > 40,   "CRITICAL", "Soil temperature critical — root damage risk"),
-    ("temperature",  lambda v: v < 5,    "WARNING",  "Soil temperature low — microbial activity reduced"),
-    ("conductivity", lambda v: v > 1500, "WARNING",  "EC high — possible salt accumulation"),
-    ("nitrogen",     lambda v: v < 20,   "WARNING",  "Nitrogen deficiency detected"),
-    ("phosphorus",   lambda v: v < 10,   "WARNING",  "Phosphorus deficiency detected"),
-    ("potassium",    lambda v: v < 50,   "WARNING",  "Potassium deficiency detected"),
+    ("moisture",     "low",  "CRITICAL", "Moisture critically low — risk of crop stress"),
+    ("moisture",     "high", "WARNING",  "Moisture too high — waterlogging risk"),
+    ("ph",           "low",  "WARNING",  "pH too acidic — nutrient lock-out likely"),
+    ("ph",           "high", "WARNING",  "pH too alkaline — limits phosphorus uptake"),
+    ("temperature",  "high", "CRITICAL", "Soil temperature critical — root damage risk"),
+    ("temperature",  "low",  "WARNING",  "Soil temperature low — microbial activity reduced"),
+    ("conductivity", "high", "WARNING",  "EC high — possible salt accumulation"),
+    ("nitrogen",     "low",  "WARNING",  "Nitrogen deficiency detected"),
+    ("phosphorus",   "low",  "WARNING",  "Phosphorus deficiency detected"),
+    ("potassium",    "low",  "WARNING",  "Potassium deficiency detected"),
 ]
 
 def get_alerts(row):
     if not row:
         return []
-    from datetime import datetime as _dt
-    now    = _dt.now().strftime("%H:%M:%S")
+    now = datetime.now().strftime("%H:%M:%S")
+    thresholds = get_thresholds()
     alerts = []
-    for key, fn, severity, msg in ALERT_RULES:
+    for key, bound, severity, msg in ALERT_RULES:
         val = row.get(key)
-        if val is not None:
-            try:
-                if fn(float(val)):
-                    alerts.append({"param": key, "severity": severity,
-                                   "message": msg, "value": val, "time": now})
-            except Exception:
-                pass
+        if val is None:
+            continue
+        th = thresholds.get(key, {})
+        lo, hi = th.get("lo"), th.get("hi")
+        try:
+            v = float(val)
+            breached = (
+                (bound == "low"  and lo is not None and v < lo) or
+                (bound == "high" and hi is not None and v > hi)
+            )
+            if breached:
+                alerts.append({"param": key, "severity": severity,
+                               "message": msg, "value": val, "time": now})
+        except Exception:
+            pass
     return alerts
