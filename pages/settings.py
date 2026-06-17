@@ -1,9 +1,12 @@
 """pages/settings.py — Settings & configuration page"""
-from dash import html, dcc
+from datetime import datetime
+from dash import html, dcc, callback, Output, Input, State, ALL
+import data_service as ds
 from data_service import PARAMS, C
 import components as ui
 
 def layout():
+    thresholds = ds.get_thresholds()   # current saved (or default) values
     return html.Div([
         ui.section_title("System Configuration"),
 
@@ -37,10 +40,15 @@ def layout():
             html.Div("Alert Thresholds", style={"fontSize": "14px", "fontWeight": "600",
                                                  "color": C["text"], "marginBottom": "16px"}),
             html.Div([
-                _threshold_row(k, meta) for k, meta in PARAMS.items()
+                _threshold_row(k, meta, thresholds.get(k, meta)) for k, meta in PARAMS.items()
             ]),
-            html.Button("Save Thresholds", className="iot-btn",
-                        style={"marginTop": "16px"}),
+            html.Div([
+                html.Button("Save Thresholds", id="save-thresholds-btn",
+                            n_clicks=0, className="iot-btn"),
+                html.Div(id="save-status", style={"fontSize": "12px",
+                                                   "color": C["green"],
+                                                   "marginLeft": "14px"}),
+            ], style={"display": "flex", "alignItems": "center", "marginTop": "16px"}),
         ], style=_card_style, className="kpi-card"),
 
         html.Div(style={"height": "16px"}),
@@ -78,7 +86,7 @@ _card_style = {
     "borderRadius": "16px", "padding": "24px", "marginBottom": "0",
 }
 
-def _threshold_row(key, meta):
+def _threshold_row(key, meta, current):
     return html.Div([
         html.Div([
             html.Span(meta["icon"], style={"fontSize": "16px", "marginRight": "10px"}),
@@ -89,15 +97,19 @@ def _threshold_row(key, meta):
         ], style={"display": "flex", "alignItems": "center", "flex": "1"}),
         html.Div([
             html.Label("Low warning", style=_label_style),
-            dcc.Input(value=meta["lo"], type="number", step=0.1,
-                      style={**_input_style, "width": "100px"},
-                      className="iot-input"),
+            dcc.Input(
+                id={"type": "thresh-lo", "param": key},
+                value=current["lo"], type="number", step=0.1,
+                style={**_input_style, "width": "100px"},
+                className="iot-input"),
         ], style={"marginRight": "16px"}),
         html.Div([
             html.Label("High warning", style=_label_style),
-            dcc.Input(value=meta["hi"], type="number", step=0.1,
-                      style={**_input_style, "width": "100px"},
-                      className="iot-input"),
+            dcc.Input(
+                id={"type": "thresh-hi", "param": key},
+                value=current["hi"], type="number", step=0.1,
+                style={**_input_style, "width": "100px"},
+                className="iot-input"),
         ]),
     ], style={"display": "flex", "alignItems": "center", "padding": "12px 0",
               "borderBottom": f"1px solid rgba(30,41,59,0.5)"})
@@ -109,3 +121,29 @@ def _info_row(label, value):
         html.Span(value, style={"fontSize": "12px", "color": C["text"],
                                 "fontFamily": "'JetBrains Mono', monospace"}),
     ], style={"padding": "10px 0", "borderBottom": f"1px solid rgba(30,41,59,0.5)"})
+
+# ── Save Thresholds callback ─────────────────────────────────────
+# Pattern-matching State (ALL) reads every low/high input on the page in
+# one shot, regardless of how many parameters PARAMS contains, and writes
+# them through data_service.set_thresholds(), which persists to disk and
+# busts the threshold cache. The next sensor-store refresh (or any
+# get_status/get_alerts call) immediately sees the new values.
+@callback(
+    Output("save-status", "children"),
+    Input("save-thresholds-btn", "n_clicks"),
+    State({"type": "thresh-lo", "param": ALL}, "value"),
+    State({"type": "thresh-lo", "param": ALL}, "id"),
+    State({"type": "thresh-hi", "param": ALL}, "value"),
+    prevent_initial_call=True,
+)
+def save_thresholds(n_clicks, lo_values, lo_ids, hi_values):
+    new_values = {}
+    for lo_id, lo_val, hi_val in zip(lo_ids, lo_values, hi_values):
+        if lo_val is None or hi_val is None:
+            continue
+        param = lo_id["param"]
+        if float(lo_val) >= float(hi_val):
+            return f"⚠ {param.title()}: low warning must be less than high warning — not saved"
+        new_values[param] = {"lo": lo_val, "hi": hi_val}
+    ds.set_thresholds(new_values)
+    return f"✓ Saved at {datetime.now().strftime('%H:%M:%S')} — now live on the dashboard"
